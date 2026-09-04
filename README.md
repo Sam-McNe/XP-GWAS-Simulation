@@ -38,7 +38,9 @@ Can we add more samples while preserving the allele-frequency contrast between r
 
 ## Main Results
 
-The results summarized here are based on the full simulation grid run as SLURM batch jobs on an HPC cluster.
+The full simulation was run as SLURM batch jobs on an HPC cluster. The SLURM scripts are not included because they were cluster-specific, but the R Markdown file documents the simulation model and plotting workflow. For support on implementation in your own cluster, reach out using the contact info below!
+
+The results summarized here are based on the full simulation grid run as SLURM batch jobs on an HPC cluster. 
 
 The simulations suggest that expanded pools can improve power to detect causal SNPs compared with the smaller core pools, especially when the expanded pools retain most of the allele-frequency contrast between resistant and susceptible groups.
 
