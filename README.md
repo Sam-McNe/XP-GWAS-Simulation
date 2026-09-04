@@ -78,9 +78,9 @@ Overall, the simulations support using expanded pools when additional accessions
 
 ## Author
 
-Sam McNeill
+Sam McNeill  
+USDA-ARS  
 Samuel.McNeill@usda.gov
-USDA-ARS
 
 ## Contact
 
