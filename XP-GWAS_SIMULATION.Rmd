@@ -1,0 +1,604 @@
+---
+title: "XP-GWAS_SIMULATION"
+author: "Sam McNeill"
+date: "2026-07-29"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Genome-wide XP-GWAS power simulation
+Tests:
+- effect sizes
+- expanded-pool dilution
+- number of causal SNPs
+- core vs expanded pool designs
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+# 1. USER SETTINGS
+```{r}
+# Pool sizes
+CORE_N_RES <- 11
+CORE_N_SUS <- 11
+
+EXP_N_RES <- 27
+EXP_N_SUS <- 31
+
+# Sequencing depth per pool
+DEPTH <- 100
+
+# Genome-wide SNP count
+# Start with 50,000 for testing, then increase to 300,000 for final
+M_SNPS <- 300000
+
+# Number of simulation replicates
+# Start with 50 or 100 for testing; use 500 for final
+NSIM <- 500
+
+# Effect sizes to test:
+# True Res-Sus allele-frequency difference in the core pools
+EFFECT_SIZES <- seq(0.05, 0.80, by = 0.05)
+
+# Number of causal SNPs to test
+CAUSAL_VALUES <- c(1, 2, 5)
+
+# Expanded-pool dilution values
+# 1.0 = expanded pools retain 100% of core signal
+# 0.8 = expanded pools retain 80% of core signal
+# 0.7 = expanded pools retain 70% of core signal
+# 0.6 = expanded pools retain 60% of core signal
+DILUTION_VALUES <- c(1.0, 0.8, 0.7, 0.6)
+
+# Multiple testing correction
+ALPHA <- 0.05
+CORRECTION <- "BH"
+
+set.seed(1234)
+```
+
+# 2. P-VALUE FUNCTION
+Helper function to compare allele frequencies between Res and Sus pools at every SNP with biological pool sampling plus sequencing read sampling
+```{r}
+pooled_p_with_bio_variance <- function(x1, depth1, x2, depth2, n_res, n_sus) {
+  
+  p1 <- x1 / depth1
+  p2 <- x2 / depth2
+  
+  p_pool <- (x1 + x2) / (depth1 + depth2)
+  
+  # Total variance includes biological pool sampling plus sequencing read sampling
+  se <- sqrt(
+    p_pool * (1 - p_pool) *
+      (
+        1 / (2 * n_res) +
+        1 / (2 * n_sus) +
+        1 / depth1 +
+        1 / depth2
+      )
+  )
+  
+  z <- (p1 - p2) / se
+  pval <- 2 * pnorm(-abs(z))
+  
+  pval[is.na(pval) | is.infinite(pval)] <- 1
+  
+  return(pval)
+}
+```
+
+# 3. SIMULATE ONE GENOME-WIDE XP-GWAS
+
+```{r}
+
+simulate_genome <- function(
+    n_res,
+    n_sus,
+    depth = 100,
+    m_snps = 300000,
+    n_causal = 1,
+    delta = 0.40,
+    alpha = 0.05,
+    correction = "BH"
+) {
+  
+  # Background allele frequencies for all SNPs
+  # Avoid allele frequencies too close to 0 or 1
+  p0 <- runif(m_snps, min = 0.05, max = 0.95)
+  
+  # Most SNPs are null: same allele frequency in Res and Sus
+  p_res <- p0
+  p_sus <- p0
+  
+  # Randomly choose causal SNPs
+  causal_index <- sample(seq_len(m_snps), size = n_causal, replace = FALSE)
+  is_causal <- rep(FALSE, m_snps)
+  is_causal[causal_index] <- TRUE
+  
+  # Set causal SNP allele frequencies
+  # delta = true Res-Sus allele-frequency difference
+  p_res[is_causal] <- 0.5 + delta / 2
+  p_sus[is_causal] <- 0.5 - delta / 2
+  
+  # Biological/accession sampling into pools
+  # Each accession is diploid, so each contributes 2 allele copies
+  res_alt_alleles <- rbinom(m_snps, size = 2 * n_res, prob = p_res)
+  sus_alt_alleles <- rbinom(m_snps, size = 2 * n_sus, prob = p_sus)
+  
+  # Actual allele frequency in the constructed DNA pools
+  res_pool_freq <- res_alt_alleles / (2 * n_res)
+  sus_pool_freq <- sus_alt_alleles / (2 * n_sus)
+  
+  # Sequencing/read sampling
+  res_alt_reads <- rbinom(m_snps, size = depth, prob = res_pool_freq)
+  sus_alt_reads <- rbinom(m_snps, size = depth, prob = sus_pool_freq)
+  
+  # P-values for Res vs Sus at every SNP
+  pval <- pooled_p_with_bio_variance(
+    x1 = res_alt_reads,
+    depth1 = depth,
+    x2 = sus_alt_reads,
+    depth2 = depth,
+    n_res = n_res,
+    n_sus = n_sus
+  )
+  
+  # Multiple-testing correction
+  adj_p <- p.adjust(pval, method = correction)
+  significant <- adj_p < alpha
+  
+  # Causal SNP detection summaries
+  n_causal_detected <- sum(significant & is_causal)
+  
+  causal_detected_any <- n_causal_detected >= 1
+  causal_detected_half <- n_causal_detected >= ceiling(n_causal / 2)
+  causal_detected_all <- n_causal_detected == n_causal
+  
+  # False positives among non-causal SNPs
+  false_positives <- sum(significant & !is_causal)
+  total_significant <- sum(significant)
+  
+  data.frame(
+    n_res = n_res,
+    n_sus = n_sus,
+    depth = depth,
+    m_snps = m_snps,
+    n_causal = n_causal,
+    delta = delta,
+    alpha = alpha,
+    correction = correction,
+    n_causal_detected = n_causal_detected,
+    causal_detected_any = causal_detected_any,
+    causal_detected_half = causal_detected_half,
+    causal_detected_all = causal_detected_all,
+    false_positives = false_positives,
+    total_significant = total_significant,
+    min_causal_p = min(pval[is_causal]),
+    min_causal_adj_p = min(adj_p[is_causal])
+  )
+}
+
+```
+
+# 4. ESTIMATE POWER ACROSS MANY SIMULATIONS
+
+```{r}
+estimate_genome_power <- function(
+    n_res,
+    n_sus,
+    depth = 100,
+    m_snps = 300000,
+    n_causal = 1,
+    delta = 0.40,
+    alpha = 0.05,
+    correction = "BH",
+    nsim = 500
+) {
+  
+  sims <- bind_rows(
+    replicate(
+      nsim,
+      simulate_genome(
+        n_res = n_res,
+        n_sus = n_sus,
+        depth = depth,
+        m_snps = m_snps,
+        n_causal = n_causal,
+        delta = delta,
+        alpha = alpha,
+        correction = correction
+      ),
+      simplify = FALSE
+    )
+  )
+  
+  data.frame(
+    n_res = n_res,
+    n_sus = n_sus,
+    depth = depth,
+    m_snps = m_snps,
+    n_causal = n_causal,
+    delta = delta,
+    alpha = alpha,
+    correction = correction,
+    nsim = nsim,
+    
+    # Power metrics
+    power_any = mean(sims$causal_detected_any),
+    beta_any = 1 - mean(sims$causal_detected_any),
+    
+    power_half = mean(sims$causal_detected_half),
+    beta_half = 1 - mean(sims$causal_detected_half),
+    
+    power_all = mean(sims$causal_detected_all),
+    beta_all = 1 - mean(sims$causal_detected_all),
+    
+    mean_causal_detected = mean(sims$n_causal_detected),
+    
+    # False-positive metrics
+    mean_false_positives = mean(sims$false_positives),
+    prob_any_false_positive = mean(sims$false_positives > 0),
+    mean_total_significant = mean(sims$total_significant),
+    
+    # Useful diagnostic values
+    mean_min_causal_p = mean(sims$min_causal_p),
+    mean_min_causal_adj_p = mean(sims$min_causal_adj_p)
+  )
+}
+```
+
+# 5. RUN SIMULATIONS ACROSS EFFECT SIZES, CAUSAL SNP COUNTS, AND EXPANDED-POOL DILUTION VALUES
+```{r}
+
+system.time({
+
+  simulation_results <- bind_rows(
+    
+    lapply(CAUSAL_VALUES, function(n_causal_value) {
+      
+      bind_rows(
+        
+        lapply(EFFECT_SIZES, function(delta_value) {
+          
+          # -----------------------------
+          # Core pools
+          # -----------------------------
+          core_result <- estimate_genome_power(
+            n_res = CORE_N_RES,
+            n_sus = CORE_N_SUS,
+            depth = DEPTH,
+            m_snps = M_SNPS,
+            n_causal = n_causal_value,
+            delta = delta_value,
+            alpha = ALPHA,
+            correction = CORRECTION,
+            nsim = NSIM
+          ) %>%
+            mutate(
+              pool_design = "Core",
+              design_label = paste0("Core: ", CORE_N_RES, " vs ", CORE_N_SUS),
+              dilution_factor = 1.0,
+              original_delta = delta_value,
+              tested_delta = delta_value
+            )
+          
+          # -----------------------------
+          # Expanded pools under multiple dilution assumptions
+          # -----------------------------
+          expanded_results <- bind_rows(
+            
+            lapply(DILUTION_VALUES, function(dilution_value) {
+              
+              expanded_delta <- delta_value * dilution_value
+              
+              estimate_genome_power(
+                n_res = EXP_N_RES,
+                n_sus = EXP_N_SUS,
+                depth = DEPTH,
+                m_snps = M_SNPS,
+                n_causal = n_causal_value,
+                delta = expanded_delta,
+                alpha = ALPHA,
+                correction = CORRECTION,
+                nsim = NSIM
+              ) %>%
+                mutate(
+                  pool_design = "Expanded",
+                  design_label = paste0(
+                    "Expanded: ", EXP_N_RES, " vs ", EXP_N_SUS,
+                    ", ", dilution_value * 100, "% signal retained"
+                  ),
+                  dilution_factor = dilution_value,
+                  original_delta = delta_value,
+                  tested_delta = expanded_delta
+                )
+            })
+          )
+          
+          bind_rows(core_result, expanded_results)
+        })
+      )
+    })
+  )
+
+Sys.sleep(2) 
+})
+```
+
+We need to do this on HPC because compute time is too long. 
+
+# 6. Read in CSV with results and format for plotting
+```{r}
+simulation_results <- read.csv("2000simulation_100depth_results_combined_1.csv")
+```
+
+```{r}
+
+simulation_results <- simulation_results %>%
+  mutate(
+    design_label_clean = case_when(
+      pool_design == "Core" ~ "Core 11 vs 11",
+      pool_design == "Expanded" & dilution_factor == 1.0 ~ "Expanded 100%",
+      pool_design == "Expanded" & dilution_factor == 0.88 ~ "Expanded 88%",
+      pool_design == "Expanded" & dilution_factor == 0.46 ~ "Expanded 46%",
+      pool_design == "Expanded" & dilution_factor == 0.2 ~ "Expanded 20%",
+      TRUE ~ "Unknown"
+    )
+  )
+
+simulation_results <- simulation_results %>%
+  mutate(
+    design_label_clean = factor(
+      design_label_clean,
+      levels = c(
+        "Core 11 vs 11",
+        "Expanded 100%",
+        "Expanded 88%",
+        "Expanded 46%",
+        "Expanded 20%"
+      )
+    )
+  )
+
+
+simulation_results <- simulation_results %>%
+  mutate(
+    n_causal_label = factor(
+      n_causal,
+      levels = c(1, 2, 5),
+      labels = c("1 causal SNP", "2 causal SNPs", "5 causal SNPs")
+    )
+  )
+
+design_colors <- c(
+  "Core 11 vs 11" = "black",
+  "Expanded 100%" = "#009E73",
+  "Expanded 88%" = "#0072B2",
+  "Expanded 46%" = "#E69F00",
+  "Expanded 20%" = "#D55E00"
+)
+
+# Quick look at results
+simulation_results %>%
+  select(
+    pool_design,
+    n_causal,
+    original_delta,
+    tested_delta,
+    dilution_factor,
+    power_any,
+    power_half,
+    power_all,
+    mean_causal_detected,
+    mean_false_positives,
+    prob_any_false_positive
+  )
+
+```
+
+# 7. PLOT: POWER TO DETECT AT LEAST ONE CAUSAL SNP
+
+```{r}
+
+ribbon_df <- simulation_results %>%
+  filter(design_label_clean %in% c("Expanded 46%", "Expanded 88%")) %>%
+  select(original_delta, n_causal_label, design_label_clean, power_any) %>%
+  pivot_wider(
+    names_from = design_label_clean,
+    values_from = power_any
+  )
+
+p1 <- ggplot(
+  simulation_results,
+  aes(
+    x = original_delta,
+    y = power_any,
+    color = design_label_clean
+  )
+) +
+  geom_ribbon(
+    data = ribbon_df,
+    aes(
+      x = original_delta,
+      ymin = `Expanded 46%`,
+      ymax = `Expanded 88%`
+    ),
+    inherit.aes = FALSE,
+    fill = "gray70",
+    alpha = 0.4
+  ) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  facet_wrap(~ n_causal_label) +
+  scale_color_manual(values = design_colors) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0.1, 0.8, by = 0.1)) +
+  labs(
+    title = "Fig 1. Power to Detect At Least One Causal SNP",
+    subtitle = paste0(
+      "300,000 SNPs, ",
+      "100x depth, ",
+      "2000 simulations, BH FDR < ", 0.05
+      ),
+      x = "Effect size: allele-frequency difference between Res and Sus pools",
+      y = "Estimated power",
+      color = "Design"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(size = 12),
+      plot.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+
+p1
+```
+
+# 8. PLOT: POWER TO DETECT ALL CAUSAL SNPs
+
+```{r}
+p2 <- ggplot(
+    simulation_results,
+    aes(
+      x = original_delta,
+      y = power_all,
+      color = design_label_clean
+    )
+  ) +
+    geom_line(linewidth = 1.1) +
+    geom_point(size = 2) +
+    facet_wrap(~ n_causal_label) +
+    scale_color_manual(values = design_colors) +
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_x_continuous(breaks = seq(0.1, 0.8, by = 0.1)) +
+    labs(
+      title = "Fig 2.Power to Detect All Causal SNPs",
+      subtitle = paste0(
+        "300,000 SNPs, ",
+        "100x depth, ",
+        "2000 simulations, BH FDR < ", 0.05
+      ),
+      x = "Effect size: allele-frequency difference between Res and Sus pools",
+      y = "Estimated power",
+      color = "Design"
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      legend.position = "bottom",
+      legend.title = element_text(face = "bold"),
+      legend.text = element_text(size = 12),
+      plot.title = element_text(face = "bold"),
+      strip.text = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+
+p2
+```
+
+# 9. PLOT: MEAN NUMBER OF CAUSAL SNPs DETECTED
+
+```{r}
+p3 <- ggplot(
+  simulation_results,
+  aes(
+    x = original_delta,
+    y = mean_causal_detected,
+    color = design_label_clean
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  facet_wrap(~ n_causal_label) +
+  scale_color_manual(values = design_colors) +
+  scale_x_continuous(breaks = seq(0.1, 0.8, by = 0.1)) +
+  labs(
+    title = "Fig 3.Mean Number of Causal SNPs Detected",
+    subtitle = paste0(
+        "300,000 SNPs, ",
+        "100x depth, ",
+        "2000 simulations, BH FDR < ", 0.05
+    ),
+    x = "Effect size: allele-frequency difference between Res and Sus pools",
+    y = "Mean causal SNPs detected",
+    color = "Design"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p3
+```
+
+# 10. PLOT: FALSE POSITIVES
+
+```{r}
+p4 <- ggplot(
+  simulation_results,
+  aes(
+    x = original_delta,
+    y = mean_false_positives,
+    color = design_label_clean
+  )
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 2) +
+  facet_wrap(~ n_causal_label) +
+  scale_color_manual(values = design_colors) +
+  scale_x_continuous(breaks = seq(0.1, 0.8, by = 0.1)) +
+  labs(
+    title = "Fig 4.Mean False Positives",
+    subtitle = paste0(
+        "300,000 SNPs, ",
+        "100x depth, ",
+        "2000 simulations, BH FDR < ", 0.05
+    ),
+    x = "Effect size: allele-frequency difference between Res and Sus pools",
+    y = "Mean false positives",
+    color = "Design"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+p4
+```
+
+# Step 11: Save Plots
+```{r}
+ggsave("plot1_power_any.png", p1, width = 10, height = 6, dpi = 300)
+ggsave("plot2_mean_causal_detected.png", p2, width = 10, height = 6, dpi = 300)
+ggsave("plot3_power_all.png", p3, width = 10, height = 6, dpi = 300)
+ggsave("plot4_false_positives.png", p4, width = 10, height = 6, dpi = 300)
+
+
+pdf("all_xpgwas_power_plots.pdf", width = 10, height = 6)
+
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+
+dev.off()
+```
